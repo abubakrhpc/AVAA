@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+
+import rospy
+from geometry_msgs.msg import Twist
+
+
+FORWARD_SPEED = 0.2      # m/s
+RUN_DURATION = 60.0      # seconds
+PUBLISH_RATE = 10        # Hz
+
+
+def stop_robot(pub):
+    """Safely stop the robot."""
+    pub.publish(Twist())
+    rospy.loginfo("Robot stopped.")
+
+
+def main():
+    rospy.init_node('forward_for_one_minute')
+
+    pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+    rate = rospy.Rate(PUBLISH_RATE)
+
+    # Wait for publisher to connect
+    rospy.sleep(1.0)
+
+    move_cmd = Twist()
+    move_cmd.linear.x = FORWARD_SPEED
+    move_cmd.angular.z = 0.0
+
+    start_time = rospy.Time.now()
+    rospy.loginfo("Robot moving forward for %.1f seconds...", RUN_DURATION)
+
+    try:
+        while not rospy.is_shutdown():
+            elapsed = (rospy.Time.now() - start_time).to_sec()
+
+            if elapsed < RUN_DURATION:
+                pub.publish(move_cmd)
+            else:
+                break
+
+            rate.sleep()
+
+    except rospy.ROSInterruptException:
+        pass
+    finally:
+        stop_robot(pub)
+
+    rospy.loginfo("Finished moving forward.")
+
+
+if __name__ == '__main__':
+    main()
