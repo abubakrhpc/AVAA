@@ -1,0 +1,12 @@
+HOW TO IMPLEMENT STEP BY STEP:
+
+Load gazebo first using  { ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py }
+Load SLAM using { ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true } (uses simualtion time itself so it syncs or smn i forgot)
+Now load Rviz using {  ros2 launch turtlebot3_navigation2 navigation2.launch.py use_sim_time:=true } (opens rviz with all tools alr selected)
+Now run the node { ros2 run turtlebot3_gazebo turtlebot3_drive } (for obstacle avoidance, check if this actually works irl tho)
+***should see the world being mapped out on rviz and obstacle avoidance etc***
+
+REFER LATEST AVVA CHATGPT FOR TRYING IRL ****                                                                  
+                                                  
+
+
