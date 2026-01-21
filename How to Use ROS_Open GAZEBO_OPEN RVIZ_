@@ -1,13 +1,19 @@
-OPEN TERMINAL TYPE IN ["  roslaunch turtlebot3_gazebo turtlebot3_world.launch  "] to launch the turtle bot on gazebo
+open another terminal window type in [ nano obstacle_avoidance.py ] to check and edit the python file 
 
-open another terminal window type in [ nano ~/catkin_ws/src/avaa_nav/scripts/forward_5_seconds.py ] to check and edit the python file 
-
-1.RUN [ cd ~/catkin_ws ] TO ENTER CATKIN TO RUN CODE SO THT ROBOT MOVES AUTONOMOUSLY
-2.RUN [ source ~/catkin_ws/devel/setup.bash ] INSIDE CATKINS
-3.RUN [ rosrun avaa_nav forward_5_seconds.py ] INSIDE CATKIN for it to run the code on ur bot on gazebo 
+1.RUN [ cd ~/avaa_ws/src ] TO ENTER COLCON (cd wtv) TO RUN CODE SO THT ROBOT MOVES AUTONOMOUSLY
+2.Use code like "nano" to edit the py code 
 ^^^ SHOULD work for autonomous movement on GAZEBO ^^^
 
-**TO RUN IT ON GAZEBO WITH UR KEYBOARD (NOT AUTONOMOUS)**
+*** EVERY NEW TERMINAL TYPE IN : [ source /opt/ros/humble/setup.bash
+source ~/avaa_ws/install/setup.bash ] TO GET STARTED so u can run py code aswell ***
+
+& then run [ ros2 run avaa_nav avoid ] to run the code on gazebo , open new termianl n launch gazebo
+OPEN TERMINAL TYPE IN ["  roslaunch turtlebot3_gazebo turtlebot3_world.launch  "] to launch the turtle bot on gazebo >>>>>
+
+
+
+
+**TO RUN IT ON GAZEBO WITH UR KEYBOARD (NOT AUTONOMOUS)** (ROS 1)
 
 1.LAUNCH ON GAZEBO [ roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch ] usin ros launch and the "teleop" can control robot with keybaord
 2.OPEN NEW TERMINAL AND RUN [ roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch ] on this terminal u can control the robot via w,a,s,d
