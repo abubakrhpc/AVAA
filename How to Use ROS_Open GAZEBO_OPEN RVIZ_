@@ -1,3 +1,4 @@
+ROS2:
 open another terminal window type in [ nano obstacle_avoidance.py ] to check and edit the python file 
 
 1.RUN [ cd ~/avaa_ws/src ] TO ENTER COLCON (cd wtv) TO RUN CODE SO THT ROBOT MOVES AUTONOMOUSLY
