@@ -1,4 +1,5 @@
 *********************** HOW TO USE CAMERA N VISUALIZE IT ***********************
+source /opt/ros/humble/setup.bash
 run [ ros2 run usb_cam usb_cam_node_exe ] ---------------------> this rquires its onw packages n all , its alr downlaoded on pi 
 make sure camera working and leave it rnning
 open another terminal DO NO SSH INTO PI AS X11 ONLY WORKS SCREEN CONENCTED TO PI CASUE ONLY CONSOLE CAN DO X11
@@ -6,3 +7,11 @@ NEW TERMNIMAL DO NOT SSH INTO PI , X11 WORKS ON UBUNTU 22.04 THEREFORE use this 
 NOW on same terminal run [ ros2 run image_view image_view --ros-args -r image:=/image_raw ] 
 
 this should work.
+
+TO DISLPLAY ON WEBSITE
+
+ros2 run web_video_server web_video_server
+
+THEN ON BROWSER  DO THISSSSS : BELOW 
+
+http://192.168.15.136:8080/stream?topic=/image_raw
