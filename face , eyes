@@ -1,0 +1,14 @@
+python3 anime_eyes.py
+
+
+---
+
+## ✅ Animate
+
+bash
+while true; do
+  sudo fbi -T 1 -d /dev/fb0 --noverbose anime_open.jpg
+  sleep 5
+  sudo fbi -T 1 -d /dev/fb0 --noverbose anime_closed.jpg
+  sleep 0.2
+done
