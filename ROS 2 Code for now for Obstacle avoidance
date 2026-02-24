@@ -1,21 +1,3 @@
-**** BLEOW IS THE CURRENT CODE FOR OBSTACLE AVOIDANCE REFER CLAUDE FOR CODE **********
-
-
-#!/usr/bin/env python3
-"""
-TurtleBot3 Waffle Pi Obstacle Avoidance Node
-============================================
-This node implements simple reactive obstacle avoidance using LiDAR data.
-
-Behavior:
-- Subscribes to /scan (sensor_msgs/LaserScan)
-- Publishes to /cmd_vel (geometry_msgs/Twist)
-- If obstacle detected within SAFE_DISTANCE in front sectors, stops and turns
-- Otherwise, moves forward at FORWARD_SPEED
-
-Author: Created for TurtleBot3 Waffle Pi on ROS2 Humble
-"""
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -23,222 +5,261 @@ from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 import numpy as np
 
-
 class ObstacleAvoidance(Node):
     """
     Reactive obstacle avoidance node using LiDAR scan data.
+    Improved version with hysteresis, curved avoidance, and stuck recovery.
     """
-    
+
     def __init__(self):
         super().__init__('obstacle_avoidance')
-        
+
         # ============================================================
-        # PARAMETERS - Adjust these for different behaviors
+        # PARAMETERS
         # ============================================================
-        
-        # Safety distance threshold (meters)
-        # If obstacle closer than this, robot will stop and turn
-        self.SAFE_DISTANCE = 0.5  # Conservative for real robot
-        
-        # Forward speed when path is clear (m/s)
-        # TurtleBot3 Waffle Pi max: ~0.26 m/s, we use moderate speed
-        self.FORWARD_SPEED = 0.15  # Safe moderate speed
-        
-        # Angular speed when turning to avoid obstacle (rad/s)
-        # TurtleBot3 Waffle Pi max: ~1.82 rad/s, we use moderate turn
-        self.TURN_SPEED = 0.5  # Moderate turning speed
-        
-        # Field of view angles to check for obstacles (degrees)
-        # Front sector: checks from -FRONT_ANGLE to +FRONT_ANGLE
-        self.FRONT_ANGLE = 30  # 60-degree cone in front
-        
-        # Left and right sector angles for deciding turn direction
-        self.LEFT_ANGLE_START = 10   # Start of left check zone
-        self.LEFT_ANGLE_END = 90     # End of left check zone
-        self.RIGHT_ANGLE_START = -90  # Start of right check zone (negative)
-        self.RIGHT_ANGLE_END = -10    # End of right check zone
-        
+
+        # Distance to start slowing down (outer bubble)
+        self.SLOW_DISTANCE = 0.8      # Begin decelerating here
+
+        # Distance to stop and turn (inner bubble)
+        self.SAFE_DISTANCE = 0.45     # Hard stop and turn threshold
+
+        # Speed settings
+        self.FORWARD_SPEED = 0.15     # Normal cruise speed (m/s)
+        self.TURN_SPEED = 0.55        # Turning speed (rad/s)
+
+        # Front sector full width — wider catches thin obstacles better at knee height
+        self.FRONT_ANGLE = 40         # ±40° = 80° cone in front
+
+        # Side sectors for turn direction decision
+        self.LEFT_ANGLE_START  =  15
+        self.LEFT_ANGLE_END    =  120
+        self.RIGHT_ANGLE_START = -120
+        self.RIGHT_ANGLE_END   = -15
+
+        # Hysteresis: how many consecutive clear scans before resuming forward
+        self.CLEAR_SCANS_NEEDED = 4
+        self._clear_scan_counter = 0
+
+        # Stuck recovery: if turning for too long, reverse and try other way
+        self.MAX_TURN_CYCLES = 30     # At 10 Hz → 3 seconds before recovery kicks in
+        self._turn_cycle_count = 0
+
+        # State machine
+        # States: 'forward', 'slowing', 'avoiding', 'recovering'
+        self._state = 'forward'
+        self.turn_direction = 1       # 1=left(CCW), -1=right(CW)
+        self._recovery_cycles = 0
+        self.RECOVERY_DURATION = 15   # cycles to reverse during recovery (~1.5s)
+
         # ============================================================
         # ROS2 Setup
         # ============================================================
-        
-        # QoS profile for sensor data (matches typical LiDAR settings)
-        # BEST_EFFORT reliability is standard for sensor data streams
+
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
-        
-        # Subscribe to LiDAR scan topic with appropriate QoS
+
         self.scan_subscription = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_callback,
-            sensor_qos  # Use sensor QoS profile instead of just depth
+            sensor_qos
         )
-        
-        # Publisher for velocity commands
-        self.cmd_vel_publisher = self.create_publisher(
-            Twist,
-            '/cmd_vel',
-            10
-        )
-        
-        # Timer for publishing velocity commands at consistent rate
-        # 10 Hz is good for reactive control
+
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # 10 Hz control loop
         self.timer = self.create_timer(0.1, self.timer_callback)
-        
-        # State variables
-        self.obstacle_detected = False
-        self.turn_direction = 1  # 1 for left (CCW), -1 for right (CW)
-        self.latest_scan = None
-        
-        self.get_logger().info('Obstacle Avoidance Node Started')
-        self.get_logger().info(f'Safe distance: {self.SAFE_DISTANCE}m')
-        self.get_logger().info(f'Forward speed: {self.FORWARD_SPEED}m/s')
-        self.get_logger().info(f'Turn speed: {self.TURN_SPEED}rad/s')
-        self.get_logger().info('Ready to avoid obstacles!')
-        
+
+        # Latest processed scan results (set by scan_callback, read by timer)
+        self._min_front  = float('inf')
+        self._avg_left   = float('inf')
+        self._avg_right  = float('inf')
+        self._scan_received = False
+
+        self.get_logger().info('=== Obstacle Avoidance Node Started ===')
+        self.get_logger().info(f'Slow zone:  {self.SLOW_DISTANCE}m')
+        self.get_logger().info(f'Safe zone:  {self.SAFE_DISTANCE}m')
+        self.get_logger().info(f'Fwd speed:  {self.FORWARD_SPEED} m/s')
+        self.get_logger().info(f'Turn speed: {self.TURN_SPEED} rad/s')
+
+    # ------------------------------------------------------------------
     def scan_callback(self, msg):
         """
-        Callback for LiDAR scan messages.
-        Processes scan data to detect obstacles and decide avoidance strategy.
-        
-        Args:
-            msg (LaserScan): LiDAR scan message
+        Process LaserScan: compute min distance in front sector and
+        average distances in left/right sectors for turn decision.
         """
-        self.latest_scan = msg
-        
-        # Calculate angle increment and total angles
-        num_readings = len(msg.ranges)
-        angle_min = msg.angle_min
+        angle_min       = msg.angle_min
         angle_increment = msg.angle_increment
-        
-        # Initialize lists to store distances in different sectors
+
         front_distances = []
-        left_distances = []
+        left_distances  = []
         right_distances = []
-        
-        # Process each LiDAR reading
+
         for i, distance in enumerate(msg.ranges):
-            # Skip invalid readings (inf, nan, or out of range)
-            if np.isinf(distance) or np.isnan(distance):
+            # Filter bad readings
+            if not np.isfinite(distance):
                 continue
             if distance < msg.range_min or distance > msg.range_max:
                 continue
-                
-            # Calculate angle of this reading in degrees
+
             angle_deg = np.degrees(angle_min + i * angle_increment)
-            
-            # Normalize angle to [-180, 180]
-            while angle_deg > 180:
-                angle_deg -= 360
-            while angle_deg < -180:
-                angle_deg += 360
-            
-            # Categorize reading into sectors
-            # Front sector: straight ahead
+
+            # Normalise to [-180, 180]
+            angle_deg = (angle_deg + 180) % 360 - 180
+
             if -self.FRONT_ANGLE <= angle_deg <= self.FRONT_ANGLE:
                 front_distances.append(distance)
-            
-            # Left sector: for determining turn direction
+
             if self.LEFT_ANGLE_START <= angle_deg <= self.LEFT_ANGLE_END:
                 left_distances.append(distance)
-            
-            # Right sector: for determining turn direction
+
             if self.RIGHT_ANGLE_START <= angle_deg <= self.RIGHT_ANGLE_END:
                 right_distances.append(distance)
-        
-        # ============================================================
-        # Obstacle Detection Logic
-        # ============================================================
-        
-        # Check if obstacle in front sector is too close
+
+        # Store results — use np.percentile for front instead of min,
+        # so a single spurious close return doesn't panic the robot
         if front_distances:
-            min_front_distance = min(front_distances)
-            
-            if min_front_distance < self.SAFE_DISTANCE:
-                # Obstacle detected! Determine best turn direction
-                self.obstacle_detected = True
-                
-                # Compare average distances on left vs right
-                avg_left = np.mean(left_distances) if left_distances else 0
-                avg_right = np.mean(right_distances) if right_distances else 0
-                
-                # Turn towards the side with more space
-                if avg_left > avg_right:
-                    self.turn_direction = 1  # Turn left (counter-clockwise)
-                    direction_name = "LEFT"
-                else:
-                    self.turn_direction = -1  # Turn right (clockwise)
-                    direction_name = "RIGHT"
-                
-                self.get_logger().info(
-                    f'OBSTACLE at {min_front_distance:.2f}m! Turning {direction_name}'
-                )
-            else:
-                # Path is clear
-                self.obstacle_detected = False
+            # 10th percentile: robust to a few bad returns, still catches real obstacles
+            self._min_front = float(np.percentile(front_distances, 10))
         else:
-            # No valid readings in front - be cautious and stop
-            self.obstacle_detected = True
+            # Nothing detected ahead — cautious default
+            self._min_front = 0.0
+
+        # Use median for sides to get stable averages
+        self._avg_left  = float(np.median(left_distances))  if left_distances  else 0.0
+        self._avg_right = float(np.median(right_distances)) if right_distances else 0.0
+
+        self._scan_received = True
+
+    # ------------------------------------------------------------------
+    def _choose_turn_direction(self):
+        """Pick the side with more open space. Only called when first entering avoidance."""
+        if self._avg_left >= self._avg_right:
             self.turn_direction = 1
-            self.get_logger().warn('No valid front readings - stopping')
-    
-    def timer_callback(self):
-        """
-        Timer callback to publish velocity commands at consistent rate.
-        Called at 10 Hz to ensure smooth control.
-        """
-        # Create velocity command message
-        cmd_vel = Twist()
-        
-        if self.obstacle_detected:
-            # AVOIDANCE MODE: Stop forward motion and turn
-            cmd_vel.linear.x = 0.0  # Stop moving forward
-            cmd_vel.angular.z = self.turn_direction * self.TURN_SPEED
-            
+            self.get_logger().info(
+                f'Turning LEFT  (left={self._avg_left:.2f}m, right={self._avg_right:.2f}m)'
+            )
         else:
-            # FORWARD MODE: Move forward, no turning
-            cmd_vel.linear.x = self.FORWARD_SPEED
-            cmd_vel.angular.z = 0.0
-        
-        # Publish the command
-        self.cmd_vel_publisher.publish(cmd_vel)
-    
+            self.turn_direction = -1
+            self.get_logger().info(
+                f'Turning RIGHT (left={self._avg_left:.2f}m, right={self._avg_right:.2f}m)'
+            )
+
+    # ------------------------------------------------------------------
+    def timer_callback(self):
+        """State-machine control loop at 10 Hz."""
+        cmd = Twist()
+
+        if not self._scan_received:
+            # Haven't received any scan yet — sit still
+            self.cmd_vel_publisher.publish(cmd)
+            return
+
+        front = self._min_front
+
+        # ── STATE: recovering ──────────────────────────────────────────
+        if self._state == 'recovering':
+            self._recovery_cycles += 1
+            if self._recovery_cycles >= self.RECOVERY_DURATION:
+                # Reverse direction and go back to avoiding
+                self.turn_direction *= -1
+                self._turn_cycle_count = 0
+                self._recovery_cycles = 0
+                self._state = 'avoiding'
+                self.get_logger().info('Recovery done — resuming avoidance (flipped direction)')
+            else:
+                # Back up slowly
+                cmd.linear.x  = -0.08
+                cmd.angular.z =  0.0
+            self.cmd_vel_publisher.publish(cmd)
+            return
+
+        # ── STATE: avoiding ────────────────────────────────────────────
+        if self._state == 'avoiding':
+            if front > self.SAFE_DISTANCE:
+                self._clear_scan_counter += 1
+                if self._clear_scan_counter >= self.CLEAR_SCANS_NEEDED:
+                    self._state = 'forward'
+                    self._turn_cycle_count = 0
+                    self._clear_scan_counter = 0
+                    self.get_logger().info('Path clear — resuming forward')
+            else:
+                self._clear_scan_counter = 0
+                self._turn_cycle_count += 1
+
+                if self._turn_cycle_count >= self.MAX_TURN_CYCLES:
+                    # Stuck — trigger recovery
+                    self._state = 'recovering'
+                    self._recovery_cycles = 0
+                    self.get_logger().warn('Stuck! Starting recovery (backing up)')
+                    self.cmd_vel_publisher.publish(cmd)
+                    return
+
+            # Curve rather than spin-in-place: small forward + turn
+            # This helps get around thin obstacles like table/chair legs
+            if front > self.SAFE_DISTANCE * 1.3:
+                cmd.linear.x = 0.05   # creep forward a little while turning
+            else:
+                cmd.linear.x = 0.0
+            cmd.angular.z = self.turn_direction * self.TURN_SPEED
+            self.cmd_vel_publisher.publish(cmd)
+            return
+
+        # ── STATE: slowing ─────────────────────────────────────────────
+        if self._state == 'slowing':
+            if front <= self.SAFE_DISTANCE:
+                self._state = 'avoiding'
+                self._clear_scan_counter = 0
+                self._turn_cycle_count = 0
+                self._choose_turn_direction()   # decide direction ONCE on entry
+                self.get_logger().warn(f'OBSTACLE at {front:.2f}m — entering avoidance')
+            elif front > self.SLOW_DISTANCE:
+                self._state = 'forward'
+            else:
+                # Scale speed linearly between SAFE and SLOW distances
+                ratio = (front - self.SAFE_DISTANCE) / (self.SLOW_DISTANCE - self.SAFE_DISTANCE)
+                cmd.linear.x  = max(0.04, self.FORWARD_SPEED * ratio)
+                cmd.angular.z = 0.0
+            self.cmd_vel_publisher.publish(cmd)
+            return
+
+        # ── STATE: forward (default) ───────────────────────────────────
+        if front <= self.SAFE_DISTANCE:
+            self._state = 'avoiding'
+            self._clear_scan_counter = 0
+            self._turn_cycle_count = 0
+            self._choose_turn_direction()
+            self.get_logger().warn(f'OBSTACLE at {front:.2f}m — entering avoidance')
+        elif front <= self.SLOW_DISTANCE:
+            self._state = 'slowing'
+        else:
+            cmd.linear.x  = self.FORWARD_SPEED
+            cmd.angular.z = 0.0
+
+        self.cmd_vel_publisher.publish(cmd)
+
+    # ------------------------------------------------------------------
     def destroy_node(self):
-        """
-        Clean shutdown: stop the robot before destroying node.
-        """
-        # Send stop command
-        stop_cmd = Twist()  # All zeros
-        self.cmd_vel_publisher.publish(stop_cmd)
-        self.get_logger().info('Stopping robot and shutting down')
+        stop = Twist()
+        self.cmd_vel_publisher.publish(stop)
+        self.get_logger().info('Stopping robot — node shutdown')
         super().destroy_node()
 
 
 def main(args=None):
-    """
-    Main function to initialize and run the obstacle avoidance node.
-    """
-    # Initialize ROS2 Python client library
     rclpy.init(args=args)
-    
-    # Create the obstacle avoidance node
-    obstacle_avoidance_node = ObstacleAvoidance()
-    
+    node = ObstacleAvoidance()
     try:
-        # Keep the node running
-        rclpy.spin(obstacle_avoidance_node)
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully
-        obstacle_avoidance_node.get_logger().info('Keyboard interrupt received')
+        node.get_logger().info('Keyboard interrupt')
     finally:
-        # Clean up
-        obstacle_avoidance_node.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
