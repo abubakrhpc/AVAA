@@ -1,0 +1,26 @@
+FIRST STEP: (OPTIONAL)
+
+cd ~/child_follower_ws
+rm -rf build install log
+colcon build --packages-select child_follower
+source install/setup.bash
+
+SECOND STEP (NEW TERMINAL): 
+
+source /opt/ros/humble/setup.bash
+source ~/child_follower_ws/install/setup.bash
+export TURTLEBOT3_MODEL=waffle
+export GAZEBO_MODEL_DATABASE_URI=''
+ros2 launch child_follower child_world.launch.py
+
+THIRD STEP (NEW TERMINAL): 
+
+source /opt/ros/humble/setup.bash
+source ~/child_follower_ws/install/setup.bash
+ros2 run child_follower camera_tracker
+
+FOURTH STEP (NEW TERMINAL): 
+
+source /opt/ros/humble/setup.bash
+source ~/child_follower_ws/install/setup.bash
+ros2 run child_follower follower
