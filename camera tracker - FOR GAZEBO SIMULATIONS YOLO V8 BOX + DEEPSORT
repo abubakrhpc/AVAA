@@ -1,0 +1,203 @@
+cat > ~/child_follower_ws/src/child_follower/child_follower/camera_tracker.py << 'EOF'
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image
+from std_msgs.msg import Float32MultiArray
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+import numpy as np
+import cv2
+import threading
+
+class CameraTracker(Node):
+    """
+    Subscribes to /camera/image_raw
+    Runs YOLOv8 person detection + DeepSORT tracking
+    Publishes /child_detection: [angle_deg, distance_estimate, confidence, track_id]
+    Locks onto the FIRST person detected (track ID 1) as the child
+    """
+
+    def __init__(self):
+        super().__init__('camera_tracker')
+
+        # ── PARAMS ──────────────────────────────────────────────
+        self.YOLO_CONF       = 0.5
+        self.YOLO_IMGSZ      = 320
+        self.HFOV            = 62.2   # horizontal FOV of camera in degrees
+                                      # Pi cam = 62.2, adjust for USB cam at uni
+        self.TARGET_ID       = None   # locked track ID (first person seen)
+        self.SHOW_PREVIEW    = True
+
+        # ── MODELS ──────────────────────────────────────────────
+        self.get_logger().info('Loading YOLOv8n...')
+        self.yolo = YOLO('yolov8n.pt')
+        self.get_logger().info('Loading DeepSORT...')
+        self.tracker = DeepSort(
+            max_age=30,           # keep track for 30 frames after lost
+            n_init=3,             # confirm track after 3 detections
+            max_iou_distance=0.7,
+        )
+        self.get_logger().info('Models ready!')
+
+        self.bridge = CvBridge()
+
+        # ── ROS2 ────────────────────────────────────────────────
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        self.img_sub = self.create_subscription(
+            Image,
+            '/camera/image_raw',
+            self.image_callback,
+            sensor_qos
+        )
+
+        # Publishes [angle_deg, bbox_area_frac, confidence, track_id]
+        self.detection_pub = self.create_publisher(
+            Float32MultiArray,
+            '/child_detection',
+            10
+        )
+
+        self.get_logger().info('Camera tracker started — watching /camera/image_raw')
+        self.get_logger().info(f'Will lock onto first person detected as child')
+
+    # ── IMAGE CALLBACK ───────────────────────────────────────────
+    def image_callback(self, msg):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Bridge error: {e}')
+            return
+
+        h, w = frame.shape[:2]
+        frame_cx = w / 2.0
+
+        # ── YOLO detection (persons only, class 0) ───────────────
+        results = self.yolo(
+            frame,
+            imgsz=self.YOLO_IMGSZ,
+            conf=self.YOLO_CONF,
+            classes=[0],    # 0 = person only
+            verbose=False
+        )
+
+        # Build detection list for DeepSORT: [[x1,y1,x2,y2], conf, class]
+        detections = []
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = map(float, box.xyxy[0])
+            conf = float(box.conf[0])
+            detections.append(([x1, y1, x2-x1, y2-y1], conf, 'person'))
+
+        # ── DEEPSORT update ──────────────────────────────────────
+        tracks = self.tracker.update_tracks(detections, frame=frame)
+
+        best_track  = None
+        best_area   = 0.0
+
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+
+            tid = track.track_id
+
+            # Lock onto first confirmed person as child
+            if self.TARGET_ID is None:
+                self.TARGET_ID = tid
+                self.get_logger().info(f'LOCKED onto track ID {tid} as child!')
+
+            if tid != self.TARGET_ID:
+                # Draw other people in grey
+                if self.SHOW_PREVIEW:
+                    ltrb = track.to_ltrb()
+                    x1,y1,x2,y2 = map(int, ltrb)
+                    cv2.rectangle(frame, (x1,y1), (x2,y2), (128,128,128), 1)
+                    cv2.putText(frame, f'ID:{tid}', (x1,y1-5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128,128,128), 1)
+                continue
+
+            # This is our child
+            ltrb = track.to_ltrb()
+            x1, y1, x2, y2 = map(int, ltrb)
+            bbox_cx = (x1 + x2) / 2.0
+            area_frac = ((x2-x1) * (y2-y1)) / (w * h)
+
+            if area_frac > best_area:
+                best_area  = area_frac
+                best_track = {
+                    'id':     tid,
+                    'cx':     bbox_cx,
+                    'area':   area_frac,
+                    'x1y1x2y2': (x1, y1, x2, y2)
+                }
+
+        # ── PUBLISH ──────────────────────────────────────────────
+        if best_track:
+            # Angle: positive = right, negative = left
+            angle_deg = ((best_track['cx'] - frame_cx) / frame_cx) * (self.HFOV / 2.0)
+
+            msg_out = Float32MultiArray()
+            msg_out.data = [
+                float(angle_deg),
+                float(best_track['area']),
+                1.0,
+                float(best_track['id'])
+            ]
+            self.detection_pub.publish(msg_out)
+
+            if self.SHOW_PREVIEW:
+                x1,y1,x2,y2 = best_track['x1y1x2y2']
+                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.putText(
+                    frame,
+                    f'CHILD ID:{best_track["id"]}  angle:{angle_deg:.1f}',
+                    (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2
+                )
+
+        else:
+            # No child detected — publish lost signal
+            msg_out = Float32MultiArray()
+            msg_out.data = [0.0, 0.0, 0.0, -1.0]
+            self.detection_pub.publish(msg_out)
+
+        # ── PREVIEW ──────────────────────────────────────────────
+        if self.SHOW_PREVIEW:
+            # Draw centre line
+            cv2.line(frame, (int(frame_cx), 0), (int(frame_cx), h), (255,255,0), 1)
+            cv2.putText(
+                frame,
+                f'TARGET ID: {self.TARGET_ID}',
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0,255,0) if best_track else (0,0,255), 2
+            )
+            cv2.imshow('AVAA - Child Tracker', frame)
+            cv2.waitKey(1)
+
+    def destroy_node(self):
+        cv2.destroyAllWindows()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CameraTracker()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+EOF
+
+
