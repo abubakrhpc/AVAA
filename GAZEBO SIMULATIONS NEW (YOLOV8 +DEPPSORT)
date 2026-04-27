@@ -1,0 +1,166 @@
+THE WORLD in which this is simulated 
+
+cat > ~/child_follower_ws/src/child_follower/worlds/child_follow.world << 'EOF'
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="child_follow_world">
+
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <update_rate>10.0</update_rate>
+    </plugin>
+
+    <physics type="ode">
+      <max_step_size>0.01</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>100</real_time_update_rate>
+    </physics>
+
+    <light name="sun" type="directional">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.1 0.1 0.1 1</specular>
+      <direction>-0.5 0.5 -1</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="col">
+          <geometry><plane><normal>0 0 1</normal><size>20 20</size></plane></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><plane><normal>0 0 1</normal><size>20 20</size></plane></geometry>
+          <material><ambient>0.8 0.8 0.8 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Small boxes -->
+    <model name="box1">
+      <static>true</static><pose>1.5 1.0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.4 0.4 0.5</size></box></geometry>
+          <material><ambient>0.8 0.2 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="box2">
+      <static>true</static><pose>-1.0 2.0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.4 0.4 0.5</size></box></geometry>
+          <material><ambient>0.2 0.8 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="box3">
+      <static>true</static><pose>2.5 2.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.4 0.4 0.5</size></box></geometry>
+          <material><ambient>0.2 0.2 0.8 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="box4">
+      <static>true</static><pose>-0.5 -1.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.4 0.4 0.5</size></box></geometry>
+          <material><ambient>0.8 0.8 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="box5">
+      <static>true</static><pose>3.0 1.0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.4 0.4 0.5</size></box></geometry>
+          <material><ambient>0.8 0.2 0.8 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- Wider wall-like obstacles -->
+    <model name="wall1">
+      <static>true</static><pose>1.0 -1.0 0.25 0 0 0.7854</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.2 0.15 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.2 0.15 0.5</size></box></geometry>
+          <material><ambient>0.5 0.3 0.1 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall2">
+      <static>true</static><pose>-2.0 1.0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.5 0.15 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.5 0.15 0.5</size></box></geometry>
+          <material><ambient>0.3 0.5 0.5 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="wall3">
+      <static>true</static><pose>3.5 -1.0 0.25 0 0 1.5707</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.0 0.15 0.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.0 0.15 0.5</size></box></geometry>
+          <material><ambient>0.5 0.1 0.3 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- Thin poles (like chair legs) -->
+    <model name="pole1">
+      <static>true</static><pose>0.5 3.0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.05</radius><length>0.8</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.05</radius><length>0.8</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="pole2">
+      <static>true</static><pose>2.0 -2.0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.05</radius><length>0.8</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.05</radius><length>0.8</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="pole3">
+      <static>true</static><pose>-2.5 -0.5 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.05</radius><length>0.8</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.05</radius><length>0.8</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <actor name="child">
+      <pose>2 0 0 0 0 0</pose>
+      <skin><filename>walk.dae</filename><scale>0.7</scale></skin>
+      <animation name="walking">
+        <filename>walk.dae</filename>
+        <scale>0.7</scale>
+        <interpolate_x>true</interpolate_x>
+      </animation>
+      <script>
+        <loop>true</loop>
+        <delay_start>0.0</delay_start>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="walking">
+          <waypoint><time>0</time><pose>2 0 0 0 0 0</pose></waypoint>
+          <waypoint><time>8</time><pose>4 0 0 0 0 0</pose></waypoint>
+          <waypoint><time>16</time><pose>4 4 0 0 0 1.5707</pose></waypoint>
+          <waypoint><time>24</time><pose>0 4 0 0 0 3.1416</pose></waypoint>
+          <waypoint><time>32</time><pose>0 0 0 0 0 -1.5707</pose></waypoint>
+          <waypoint><time>40</time><pose>2 0 0 0 0 0</pose></waypoint>
+        </trajectory>
+      </script>
+    </actor>
+
+  </world>
+</sdf>
+EOF
