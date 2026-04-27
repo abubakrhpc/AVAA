@@ -1,0 +1,221 @@
+THE CHILD FOLLOWING CODE USING PID: AND FGM FOR OBSTACLE AVOIDANCE 
+
+cat > ~/child_follower_ws/src/child_follower/child_follower/follower.py << 'EOF'
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from gazebo_msgs.srv import GetEntityState
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+import numpy as np
+import threading
+
+class ChildFollower(Node):
+    def __init__(self):
+        super().__init__('child_follower')
+
+        # ── PARAMS ──────────────────────────────────────────────
+        self.FOLLOW_DISTANCE  = 1.0
+        self.MAX_SPEED        = 0.20
+        self.MAX_TURN         = 0.6
+        self.SAFE_DISTANCE    = 0.40
+        self.ANGLE_DEADZONE   = 5.0   # degrees — don't turn if already facing close enough
+
+        # PID
+        self.Kp = 0.5
+        self.Ki = 0.003
+        self.Kd = 0.08
+        self._integral   = 0.0
+        self._prev_error = 0.0
+        self._dt         = 0.2
+
+        # Angular smoothing — averages last N turn commands
+        self.TURN_SMOOTH  = 4
+        self._turn_history = [0.0] * self.TURN_SMOOTH
+
+        # State
+        self._child_pos    = None
+        self._robot_pos    = None
+        self._robot_ori    = None
+        self._min_front    = float('inf')
+        self._avg_left     = float('inf')
+        self._avg_right    = float('inf')
+        self._lock         = threading.Lock()
+        self._positions_ok = False
+
+        # ── SERVICE CLIENT ───────────────────────────────────────
+        self.get_state = self.create_client(GetEntityState, '/get_entity_state')
+        while not self.get_state.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for /get_entity_state...')
+
+        # ── LIDAR ────────────────────────────────────────────────
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, sensor_qos
+        )
+
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.control_timer = self.create_timer(self._dt, self.control_loop)
+
+        self._fetch_thread = threading.Thread(target=self.fetch_loop, daemon=True)
+        self._fetch_thread.start()
+
+        self.get_logger().info('Child Follower ready!')
+
+    # ── LIDAR ────────────────────────────────────────────────────
+    def scan_callback(self, msg):
+        front, left, right = [], [], []
+        for i, d in enumerate(msg.ranges):
+            if not np.isfinite(d) or d < msg.range_min or d > msg.range_max:
+                continue
+            angle = np.degrees(msg.angle_min + i * msg.angle_increment)
+            angle = (angle + 180) % 360 - 180
+            if abs(angle) <= 40:
+                front.append(d)
+            if 15 <= angle <= 120:
+                left.append(d)
+            if -120 <= angle <= -15:
+                right.append(d)
+        with self._lock:
+            self._min_front = float(np.percentile(front, 10)) if front else float('inf')
+            self._avg_left  = float(np.median(left))          if left  else float('inf')
+            self._avg_right = float(np.median(right))         if right else float('inf')
+
+    # ── FETCH LOOP ───────────────────────────────────────────────
+    def fetch_loop(self):
+        while rclpy.ok():
+            try:
+                child_pose = self.call_service('child')
+                robot_pose = self.call_service('waffle')
+                if child_pose and robot_pose:
+                    with self._lock:
+                        self._child_pos    = child_pose.position
+                        self._robot_pos    = robot_pose.position
+                        self._robot_ori    = robot_pose.orientation
+                        self._positions_ok = True
+            except Exception as e:
+                self.get_logger().warn(f'Fetch error: {e}', throttle_duration_sec=2.0)
+            threading.Event().wait(0.15)
+
+    def call_service(self, name):
+        req = GetEntityState.Request()
+        req.name = name
+        req.reference_frame = 'world'
+        future = self.get_state.call_async(req)
+        elapsed = 0.0
+        while not future.done() and elapsed < 0.5:
+            threading.Event().wait(0.01)
+            elapsed += 0.01
+        if future.done() and future.result() and future.result().success:
+            return future.result().state.pose
+        return None
+
+    # ── PID ──────────────────────────────────────────────────────
+    def pid_speed(self, distance):
+        error = distance - self.FOLLOW_DISTANCE
+        self._integral   = np.clip(self._integral + error * self._dt, -1.0, 1.0)
+        derivative        = (error - self._prev_error) / self._dt
+        self._prev_error  = error
+        output = self.Kp * error + self.Ki * self._integral + self.Kd * derivative
+        return float(np.clip(output, 0.0, self.MAX_SPEED))
+
+    # ── SMOOTHED TURN ─────────────────────────────────────────────
+    def smooth_turn(self, raw_turn):
+        self._turn_history.pop(0)
+        self._turn_history.append(raw_turn)
+        return float(np.mean(self._turn_history))
+
+    # ── CONTROL LOOP ─────────────────────────────────────────────
+    def control_loop(self):
+        cmd = Twist()
+
+        with self._lock:
+            child_pos    = self._child_pos
+            robot_pos    = self._robot_pos
+            robot_ori    = self._robot_ori
+            positions_ok = self._positions_ok
+            min_front    = self._min_front
+            avg_left     = self._avg_left
+            avg_right    = self._avg_right
+
+        if not positions_ok:
+            self.get_logger().info('Waiting for positions...', throttle_duration_sec=2.0)
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── OBSTACLE AVOIDANCE ───────────────────────────────────
+        if min_front < self.SAFE_DISTANCE:
+            cmd.linear.x  = 0.0
+            cmd.angular.z = 0.4 if avg_left >= avg_right else -0.4
+            self.get_logger().warn(
+                f'Obstacle at {min_front:.2f}m!', throttle_duration_sec=0.5
+            )
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── COMPUTE HEADING TO CHILD ─────────────────────────────
+        q = robot_ori
+        robot_yaw = np.arctan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
+
+        dx = child_pos.x - robot_pos.x
+        dy = child_pos.y - robot_pos.y
+        distance = float(np.sqrt(dx**2 + dy**2))
+
+        world_angle    = np.arctan2(dy, dx)
+        relative_angle = world_angle - robot_yaw
+        relative_angle = (relative_angle + np.pi) % (2 * np.pi) - np.pi
+        angle_deg      = np.degrees(relative_angle)
+
+        # ── STOP IF TOO CLOSE ────────────────────────────────────
+        if distance < 0.4:
+            # Still face the child even when stopped
+            if abs(angle_deg) > self.ANGLE_DEADZONE:
+                cmd.angular.z = self.smooth_turn(
+                    float(np.clip(relative_angle * 0.8, -self.MAX_TURN, self.MAX_TURN))
+                )
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── ANGULAR: deadzone + smoothing ────────────────────────
+        if abs(angle_deg) > self.ANGLE_DEADZONE:
+            raw_turn = float(np.clip(relative_angle * 1.0, -self.MAX_TURN, self.MAX_TURN))
+        else:
+            raw_turn = 0.0
+        cmd.angular.z = self.smooth_turn(raw_turn)
+
+        # ── LINEAR: slow down while turning sharply ───────────────
+        turn_factor   = 1.0 - min(abs(angle_deg) / 90.0, 1.0)
+        cmd.linear.x  = self.pid_speed(distance) * turn_factor
+
+        self.get_logger().info(
+            f'Child: {distance:.2f}m  angle: {angle_deg:.1f}°  '
+            f'speed: {cmd.linear.x:.2f}  turn: {cmd.angular.z:.2f}  '
+            f'front: {min_front:.2f}m'
+        )
+        self.cmd_pub.publish(cmd)
+
+    def destroy_node(self):
+        self.cmd_pub.publish(Twist())
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ChildFollower()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+EOF
