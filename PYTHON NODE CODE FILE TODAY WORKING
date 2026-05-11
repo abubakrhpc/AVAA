@@ -1,0 +1,591 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+import rclpy
+import torch
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import LaserScan, Image
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool, Float32
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+import numpy as np
+import cv2
+import threading
+
+OBSTACLE_CLASSES = {
+    'chair', 'dining table', 'couch', 'sofa', 'bench',
+    'dog', 'cat', 'laptop', 'tv', 'monitor',
+    'suitcase', 'backpack', 'potted plant', 'vase', 'bottle',
+    'refrigerator', 'oven', 'microwave',
+}
+COLORS = [(255,100,100),(100,255,100),(100,100,255),(255,255,100),
+          (255,100,255),(100,255,255),(255,165,0),(0,128,255),(128,0,255),(0,255,128)]
+def get_color(cls): return COLORS[cls % len(COLORS)]
+
+
+class Pi4BNodeReal(Node):
+    """
+    Real-world Pi4B node.
+    Child position: YOLO + DeepSORT from USB camera
+    Distance:       BLE beacon (FSC-BP108)
+    Obstacles:      LIDAR + YOLO fusion
+    """
+
+    def __init__(self):
+        super().__init__('pi4b_node_real')
+
+        # ── FOLLOWING PARAMS ─────────────────────────────────────
+        self.FOLLOW_DISTANCE = 1.0
+        self.MAX_SPEED       = 0.20
+        self.MAX_TURN        = 0.6
+        self.ANGLE_DEADZONE  = 5.0
+        self.TURN_SMOOTH     = 4
+        self._turn_history   = [0.0] * self.TURN_SMOOTH
+        self.Kp = 0.5
+        self.Ki = 0.003
+        self.Kd = 0.08
+        self._integral   = 0.0
+        self._prev_error = 0.0
+        self._dt         = 0.1
+
+        # ── CAMERA PARAMS ────────────────────────────────────────
+        # UPDATE THIS if camera is /dev/video1
+        self.CAM_INDEX   = 0
+        self.CAM_WIDTH   = 640
+        self.CAM_HEIGHT  = 480
+        self.YOLO_IMGSZ  = 320
+        self.MIN_CONF    = 0.5
+        # Horizontal FOV of your USB camera in degrees
+        # Measure or check spec sheet — common values: 60, 78, 90
+        self.HFOV        = 78.0
+
+        # ── OBSTACLE AVOIDANCE PARAMS ────────────────────────────
+        self.SLOW_DISTANCE      = 0.8
+        self.SAFE_DISTANCE      = 0.45
+        self.TURN_SPEED         = 0.55
+        self.FRONT_ANGLE        = 40
+        self.LEFT_ANGLE_START   =  15
+        self.LEFT_ANGLE_END     =  120
+        self.RIGHT_ANGLE_START  = -120
+        self.RIGHT_ANGLE_END    = -15
+        self.CLEAR_SCANS_NEEDED = 4
+        self.MAX_TURN_CYCLES    = 30
+        self.RECOVERY_DURATION  = 15
+
+        # YOLO obstacle fusion
+        self.CENTER_ZONE_FRAC     = 0.40
+        self.DANGER_AREA_FRAC     = 0.25
+        self.WARNING_AREA_FRAC    = 0.08
+        self.CAM_DANGER_THRESHOLD = 0.75
+        self.CAM_WARN_THRESHOLD   = 0.40
+        self.CAM_DECAY_RATE       = 0.12
+        self.CAM_TIMEOUT_SEC      = 1.5
+        self.SHOW_PREVIEW         = True
+
+        # ── SEARCH PARAMS ────────────────────────────────────────
+        self.SEARCH_TIMEOUT  = 3.0
+        self.BLE_CLOSE       = 2.0
+        self.BLE_MEDIUM      = 5.0
+        self.MAX_SEARCH_TIME = 30.0
+
+        # ── STATE ────────────────────────────────────────────────
+        self._avoidance_state    = 'forward'
+        self._turn_direction     = 1
+        self._clear_scan_counter = 0
+        self._turn_cycle_count   = 0
+        self._recovery_cycles    = 0
+
+        self._main_state        = 'following'
+        self._last_seen_time    = self.get_clock().now()
+        self._search_start_time = None
+
+        self._game_mode      = False
+        self._ble_distance   = None
+        self._min_front      = float('inf')
+        self._avg_left       = float('inf')
+        self._avg_right      = float('inf')
+        self._scan_received  = False
+        self._cam_danger     = 0.0
+        self._cam_last_update = self.get_clock().now()
+
+        # Child tracking state (from DeepSORT)
+        self._child_angle    = None   # degrees left/right
+        self._child_visible  = False
+        self._child_track_id = None
+        self._target_id      = None   # locked DeepSORT ID
+
+        self._cam_lock  = threading.Lock()
+        self._child_lock = threading.Lock()
+
+        # ── ROS2 SETUP ───────────────────────────────────────────
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, sensor_qos
+        )
+        self.game_mode_sub = self.create_subscription(
+            Bool, '/game_mode', self.game_mode_callback, 10
+        )
+        self.ble_sub = self.create_subscription(
+            Float32, '/ble_distance', self.ble_callback, 10
+        )
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.timer   = self.create_timer(self._dt, self.control_loop)
+
+        # ── LOAD MODELS ──────────────────────────────────────────
+        self.get_logger().info('Loading YOLOv8n...')
+        self.yolo = YOLO('yolov8n.pt')
+        self.yolo.to('cpu')
+        self.get_logger().info('Loading DeepSORT...')
+        self.tracker = DeepSort(
+            max_age=30,
+            n_init=3,
+            max_iou_distance=0.7,
+            embedder="mobilenet",
+            embedder_gpu=False,
+        )
+        self.get_logger().info('Models ready!')
+
+        # ── START CAMERA THREAD ──────────────────────────────────
+        self._cam_running = True
+        self._cam_thread  = threading.Thread(
+            target=self._camera_loop, daemon=True
+        )
+        self._cam_thread.start()
+
+        self.get_logger().info('=== Pi4B Real World Node Started ===')
+        self.get_logger().info(f'Camera index: {self.CAM_INDEX}')
+        self.get_logger().info(f'Following distance: {self.FOLLOW_DISTANCE}m')
+
+    # ── SCAN CALLBACK ────────────────────────────────────────────
+    def scan_callback(self, msg):
+        front, left, right = [], [], []
+        for i, d in enumerate(msg.ranges):
+            if not np.isfinite(d) or d < msg.range_min or d > msg.range_max:
+                continue
+            angle = np.degrees(msg.angle_min + i * msg.angle_increment)
+            angle = (angle + 180) % 360 - 180
+            if -self.FRONT_ANGLE <= angle <= self.FRONT_ANGLE:
+                front.append(d)
+            if self.LEFT_ANGLE_START <= angle <= self.LEFT_ANGLE_END:
+                left.append(d)
+            if self.RIGHT_ANGLE_START <= angle <= self.RIGHT_ANGLE_END:
+                right.append(d)
+        self._min_front = float(np.percentile(front, 10)) if front else float('inf')
+        self._avg_left  = float(np.median(left))          if left  else float('inf')
+        self._avg_right = float(np.median(right))         if right else float('inf')
+        self._scan_received = True
+
+    def game_mode_callback(self, msg):
+        self._game_mode = msg.data
+        if msg.data:
+            self.get_logger().info('GAME MODE ON')
+
+    def ble_callback(self, msg):
+        if msg.data > 0:
+            self._ble_distance = msg.data
+
+    # ── CAMERA THREAD (YOLO + DeepSORT) ─────────────────────────
+    def _camera_loop(self):
+        cap = cv2.VideoCapture(self.CAM_INDEX)
+        if not cap.isOpened():
+            self.get_logger().error(
+                f'Cannot open camera {self.CAM_INDEX}! '
+                f'Try changing CAM_INDEX to 1'
+            )
+            self._cam_running = False
+            return
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.CAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAM_HEIGHT)
+        self.get_logger().info(f'Camera {self.CAM_INDEX} opened!')
+
+        class_names = self.yolo.names
+        frame_cx = self.CAM_WIDTH / 2.0
+        cx_min   = self.CAM_WIDTH  * (0.5 - self.CENTER_ZONE_FRAC / 2)
+        cx_max   = self.CAM_WIDTH  * (0.5 + self.CENTER_ZONE_FRAC / 2)
+        f_area   = self.CAM_WIDTH  * self.CAM_HEIGHT
+
+        while self._cam_running:
+            ret, frame = cap.read()
+            if not ret:
+                self.get_logger().warn('Camera frame failed', throttle_duration_sec=2.0)
+                continue
+
+            # ── YOLO detection ───────────────────────────────────
+            frame_rgb=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            results = self.yolo(
+              frame,
+              imgsz=256,
+              device='cpu',
+              verbose=False)
+            all_boxes = results[0].boxes
+
+            # Separate person detections for DeepSORT
+            person_dets  = []
+            obstacle_score = 0.0
+
+            for box in all_boxes:
+                conf     = float(box.conf[0])
+                if conf < self.MIN_CONF:
+                    continue
+                cls      = int(box.cls[0])
+                cls_name = class_names[cls]
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                bbox_cx  = (x1 + x2) / 2.0
+
+                if cls_name == 'person':
+                    # Send to DeepSORT for tracking
+                    person_dets.append(
+                        ([x1, y1, x2-x1, y2-y1], conf, 'person')
+                    )
+                elif cls_name in OBSTACLE_CLASSES:
+                    # Obstacle detection
+                    if cx_min <= bbox_cx <= cx_max:
+                        area_frac = ((x2-x1)*(y2-y1)) / f_area
+                        if area_frac >= self.DANGER_AREA_FRAC:
+                            score = 1.0
+                        elif area_frac >= self.WARNING_AREA_FRAC:
+                            score = 0.5 + 0.5 * (
+                                (area_frac - self.WARNING_AREA_FRAC) /
+                                (self.DANGER_AREA_FRAC - self.WARNING_AREA_FRAC)
+                            )
+                        else:
+                            score = 0.3
+                        obstacle_score = max(obstacle_score, score)
+
+                        if self.SHOW_PREVIEW:
+                            color = get_color(cls)
+                            cv2.rectangle(frame,
+                                (int(x1),int(y1)),(int(x2),int(y2)), color, 1)
+                            cv2.putText(frame,
+                                f'{cls_name} [{score:.2f}]',
+                                (int(x1)+4, int(y1)-4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # ── DeepSORT tracking ────────────────────────────────
+            tracks = self.tracker.update_tracks(person_dets, frame=frame)
+
+            child_angle   = None
+            child_visible = False
+
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+                tid = track.track_id
+
+                # Lock onto first confirmed person as child
+                if self._target_id is None:
+                    self._target_id = tid
+                    self.get_logger().info(
+                        f'LOCKED onto person ID {tid} as child!'
+                    )
+
+                if tid != self._target_id:
+                    # Draw other people in grey
+                    if self.SHOW_PREVIEW:
+                        ltrb = track.to_ltrb()
+                        x1,y1,x2,y2 = map(int, ltrb)
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(128,128,128),1)
+                        cv2.putText(frame, f'other ID:{tid}',
+                            (x1,y1-5), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, (128,128,128), 1)
+                    continue
+
+                # This is our child
+                ltrb = track.to_ltrb()
+                x1,y1,x2,y2 = map(int, ltrb)
+                bbox_cx = (x1 + x2) / 2.0
+
+                # Angle from centre of frame
+                child_angle   = ((bbox_cx - frame_cx) / frame_cx) * (self.HFOV / 2.0)
+                child_visible = True
+
+                if self.SHOW_PREVIEW:
+                    cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+                    cv2.putText(frame,
+                        f'CHILD ID:{tid}  angle:{child_angle:.1f}',
+                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0,255,0), 2)
+
+            # ── Update shared state ──────────────────────────────
+            with self._child_lock:
+                self._child_angle   = child_angle
+                self._child_visible = child_visible
+                if child_visible:
+                    self._last_seen_time = self.get_clock().now()
+
+            with self._cam_lock:
+                if obstacle_score > self._cam_danger:
+                    self._cam_danger = obstacle_score
+                self._cam_last_update = self.get_clock().now()
+
+    # ── CAMERA FUSION HELPERS ────────────────────────────────────
+    def _update_cam_danger(self):
+        with self._cam_lock:
+            age = (self.get_clock().now() -
+                   self._cam_last_update).nanoseconds / 1e9
+            if age > self.CAM_TIMEOUT_SEC:
+                self._cam_danger = 0.0
+            else:
+                self._cam_danger = max(
+                    0.0, self._cam_danger - self.CAM_DECAY_RATE
+                )
+            return self._cam_danger
+
+    def _effective_front(self, cam_danger):
+        lidar = self._min_front
+        if cam_danger >= self.CAM_DANGER_THRESHOLD:
+            return min(lidar, self.SAFE_DISTANCE - 0.05)
+        elif cam_danger >= self.CAM_WARN_THRESHOLD:
+            return min(lidar, self.SLOW_DISTANCE - 0.05)
+        return lidar
+
+    def _choose_turn_direction(self):
+        self._turn_direction = 1 if self._avg_left >= self._avg_right else -1
+
+    # ── PID ──────────────────────────────────────────────────────
+    def pid_speed(self, distance):
+        error = distance - self.FOLLOW_DISTANCE
+        self._integral   = np.clip(
+            self._integral + error * self._dt, -1.0, 1.0
+        )
+        derivative        = (error - self._prev_error) / self._dt
+        self._prev_error  = error
+        output = (self.Kp * error +
+                  self.Ki * self._integral +
+                  self.Kd * derivative)
+        return float(np.clip(output, 0.0, self.MAX_SPEED))
+
+    def smooth_turn(self, raw):
+        self._turn_history.pop(0)
+        self._turn_history.append(raw)
+        return float(np.mean(self._turn_history))
+
+    # ── SEARCH BEHAVIOR ──────────────────────────────────────────
+    def _get_time_since_seen(self):
+        return (self.get_clock().now() -
+                self._last_seen_time).nanoseconds / 1e9
+
+    def _get_search_duration(self):
+        if self._search_start_time is None:
+            return 0.0
+        return (self.get_clock().now() -
+                self._search_start_time).nanoseconds / 1e9
+
+    def _search_behavior(self, cmd):
+        ble = self._ble_distance
+        if self._get_search_duration() > self.MAX_SEARCH_TIME:
+            self._main_state = 'waiting'
+            return cmd
+
+        if ble is None or ble < 0:
+            cmd.angular.z = 0.3
+        elif ble <= self.BLE_CLOSE:
+            cmd.angular.z = 0.3
+            cmd.linear.x  = 0.0
+        elif ble <= self.BLE_MEDIUM:
+            cmd.angular.z = 0.5
+            cmd.linear.x  = 0.08
+        else:
+            cmd.angular.z = 0.5
+            cmd.linear.x  = 0.12
+
+        self.get_logger().info(
+            f'SEARCHING — BLE:{ble:.1f}m' if ble else 'SEARCHING — no BLE',
+            throttle_duration_sec=1.0
+        )
+        return cmd
+
+    # ── MAIN CONTROL LOOP ─────────────────────────────────────────
+    def control_loop(self):
+        cmd = Twist()
+
+        if not self._scan_received:
+            self.cmd_pub.publish(cmd)
+            return
+
+        cam_danger = self._update_cam_danger()
+        front      = self._effective_front(cam_danger)
+
+        with self._child_lock:
+            child_angle   = self._child_angle
+            child_visible = self._child_visible
+
+        # ── PRIORITY 1: GAME MODE ────────────────────────────────
+        if self._game_mode:
+            # Face child if we know where they are
+            if child_angle is not None and abs(child_angle) > self.ANGLE_DEADZONE:
+                cmd.angular.z = self.smooth_turn(float(np.clip(
+                    np.radians(child_angle) * 0.8,
+                    -self.MAX_TURN, self.MAX_TURN
+                )))
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── PRIORITY 2: OBSTACLE AVOIDANCE ───────────────────────
+        if self._avoidance_state == 'recovering':
+            self._recovery_cycles += 1
+            if self._recovery_cycles >= self.RECOVERY_DURATION:
+                self._turn_direction   *= -1
+                self._turn_cycle_count  = 0
+                self._recovery_cycles   = 0
+                self._avoidance_state   = 'avoiding'
+            else:
+                cmd.linear.x  = -0.08
+                cmd.angular.z =  0.0
+            self.cmd_pub.publish(cmd)
+            return
+
+        if self._avoidance_state == 'avoiding':
+            if front > self.SAFE_DISTANCE:
+                self._clear_scan_counter += 1
+                if self._clear_scan_counter >= self.CLEAR_SCANS_NEEDED:
+                    self._avoidance_state    = 'forward'
+                    self._turn_cycle_count   = 0
+                    self._clear_scan_counter = 0
+                    self.get_logger().info('Path clear!')
+            else:
+                self._clear_scan_counter  = 0
+                self._turn_cycle_count   += 1
+                if self._turn_cycle_count >= self.MAX_TURN_CYCLES:
+                    self._avoidance_state = 'recovering'
+                    self._recovery_cycles = 0
+                    self.cmd_pub.publish(cmd)
+                    return
+            cmd.linear.x  = 0.05 if front > self.SAFE_DISTANCE * 1.3 else 0.0
+            cmd.angular.z = self._turn_direction * self.TURN_SPEED
+            self.cmd_pub.publish(cmd)
+            return
+
+        if self._avoidance_state == 'slowing':
+            if front <= self.SAFE_DISTANCE:
+                self._avoidance_state    = 'avoiding'
+                self._clear_scan_counter = 0
+                self._turn_cycle_count   = 0
+                self._choose_turn_direction()
+            elif front > self.SLOW_DISTANCE:
+                self._avoidance_state = 'forward'
+            else:
+                ratio = ((front - self.SAFE_DISTANCE) /
+                         (self.SLOW_DISTANCE - self.SAFE_DISTANCE))
+                cmd.linear.x  = max(0.04, 0.15 * ratio)
+                cmd.angular.z = 0.0
+            self.cmd_pub.publish(cmd)
+            return
+
+        if front <= self.SAFE_DISTANCE:
+            self._avoidance_state    = 'avoiding'
+            self._clear_scan_counter = 0
+            self._turn_cycle_count   = 0
+            self._choose_turn_direction()
+            self.get_logger().warn(f'Obstacle {front:.2f}m!')
+            self.cmd_pub.publish(cmd)
+            return
+        elif front <= self.SLOW_DISTANCE:
+            self._avoidance_state = 'slowing'
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── PRIORITY 3: MAIN STATE MACHINE ───────────────────────
+        # Update main state based on child visibility
+        if child_visible:
+            if self._main_state != 'following':
+                self.get_logger().info('Child found! Resuming following')
+            self._main_state        = 'following'
+            self._search_start_time = None
+
+        elif self._get_time_since_seen() > self.SEARCH_TIMEOUT:
+            if self._main_state == 'following':
+                self._main_state        = 'searching'
+                self._search_start_time = self.get_clock().now()
+                self.get_logger().warn('Child lost! Entering search mode')
+
+        # Waiting state
+        if self._main_state == 'waiting':
+            self.get_logger().info(
+                'Waiting for child...', throttle_duration_sec=3.0
+            )
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Search state
+        if self._main_state == 'searching':
+            cmd = self._search_behavior(cmd)
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Following state
+        if child_angle is None:
+            self.get_logger().info(
+                'No child detected', throttle_duration_sec=2.0
+            )
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Use BLE distance if available, else use area estimate
+        distance = self._ble_distance if self._ble_distance else 2.0
+
+        # Stop if very close
+        if distance < 0.4:
+            if abs(child_angle) > self.ANGLE_DEADZONE:
+                cmd.angular.z = self.smooth_turn(float(np.clip(
+                    np.radians(child_angle) * 0.8,
+                    -self.MAX_TURN, self.MAX_TURN
+                )))
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Angular control
+        if abs(child_angle) > self.ANGLE_DEADZONE:
+            raw_turn = float(np.clip(
+                np.radians(child_angle) * 1.0,
+                -self.MAX_TURN, self.MAX_TURN
+            ))
+        else:
+            raw_turn = 0.0
+        cmd.angular.z = self.smooth_turn(raw_turn)
+
+        # Linear control
+        turn_factor  = 1.0 - min(abs(child_angle) / 90.0, 1.0)
+        cmd.linear.x = self.pid_speed(distance) * turn_factor
+
+        self.get_logger().info(
+            f'[FOLLOWING] angle:{child_angle:.1f}° '
+            f'dist:{distance:.2f}m '
+            f'speed:{cmd.linear.x:.2f} '
+            f'turn:{cmd.angular.z:.2f} '
+            f'front:{front:.2f}m'
+        )
+        self.cmd_pub.publish(cmd)
+
+    def destroy_node(self):
+        self._cam_running = False
+        self._cam_thread.join(timeout=2.0)
+        self.cmd_pub.publish(Twist())
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = Pi4BNodeReal()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
