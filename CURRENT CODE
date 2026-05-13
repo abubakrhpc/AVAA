@@ -1,0 +1,393 @@
+cat > ~/avaa_ws/src/child_follower/child_follower/pi4b_node_real.py << 'EOF'
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+import rclpy
+import torch
+torch.set_num_threads(2)
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from ultralytics import YOLO
+import numpy as np
+import cv2
+import threading
+import time
+
+class PersonFollower(Node):
+    def __init__(self):
+        super().__init__('person_follower')
+
+        # ── FOLLOWING PARAMS ─────────────────────────────────────
+        self.FOLLOW_DISTANCE = 1.5
+        self.MAX_SPEED       = 0.22
+        self.MAX_TURN        = 0.8
+        self.ANGLE_DEADZONE  = 5.0
+        self.TURN_SMOOTH     = 3
+        self._turn_history   = [0.0] * self.TURN_SMOOTH
+        self.Kp = 0.6
+        self.Ki = 0.003
+        self.Kd = 0.08
+        self._integral   = 0.0
+        self._prev_error = 0.0
+        self._dt         = 0.1
+
+        # ── CAMERA PARAMS ────────────────────────────────────────
+        self.CAM_INDEX     = 0
+        self.CAM_WIDTH     = 640
+        self.CAM_HEIGHT    = 480
+        self.HFOV          = 78.0
+        self.MIN_CONF      = 0.4
+        self.YOLO_INTERVAL = 0
+
+        # ── OBSTACLE AVOIDANCE PARAMS (LIDAR ONLY) ───────────────
+        self.SLOW_DISTANCE      = 0.55
+        self.SAFE_DISTANCE      = 0.30
+        self.TURN_SPEED         = 0.55
+        self.FRONT_ANGLE        = 40
+        self.LEFT_ANGLE_START   =  15
+        self.LEFT_ANGLE_END     =  120
+        self.RIGHT_ANGLE_START  = -120
+        self.RIGHT_ANGLE_END    = -15
+        self.CLEAR_SCANS_NEEDED = 4
+        self.MAX_TURN_CYCLES    = 30
+        self.RECOVERY_DURATION  = 15
+
+        # ── STATE ────────────────────────────────────────────────
+        self._avoidance_state    = 'forward'
+        self._turn_direction     = 1
+        self._clear_scan_counter = 0
+        self._turn_cycle_count   = 0
+        self._recovery_cycles    = 0
+
+        self._child_angle      = None
+        self._last_known_angle = None
+        self._child_visible    = False
+        self._last_seen_time   = self.get_clock().now()
+        self._tracker          = None
+        self._tracker_ok       = False
+        self._last_yolo_time   = 0.0
+
+        self._min_front     = float('inf')
+        self._avg_left      = float('inf')
+        self._avg_right     = float('inf')
+        self._scan_received = False
+        self._child_lock    = threading.Lock()
+
+        # ── ROS2 ─────────────────────────────────────────────────
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, sensor_qos
+        )
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.timer   = self.create_timer(self._dt, self.control_loop)
+
+        # ── LOAD YOLO ────────────────────────────────────────────
+        self.get_logger().info('Loading YOLO...')
+        self.yolo = YOLO('/home/ubuntu/yolov8n.pt')
+        self.get_logger().info('YOLO ready!')
+
+        self._cam_running = True
+        self._cam_thread = threading.Thread(
+            target=self._camera_loop,
+            daemon=True
+            )
+        self._cam_thread.start()
+        
+        self.get_logger().info('=== Person Follower Started ===')
+
+    # ── LIDAR — obstacle avoidance only ──────────────────────────
+    def scan_callback(self, msg):
+        front, left, right = [], [], []
+        for i, d in enumerate(msg.ranges):
+            if not np.isfinite(d) or d < msg.range_min or d > msg.range_max:
+                continue
+            angle = np.degrees(msg.angle_min + i * msg.angle_increment)
+            angle = (angle + 180) % 360 - 180
+            if -self.FRONT_ANGLE <= angle <= self.FRONT_ANGLE:
+                front.append(d)
+            if self.LEFT_ANGLE_START <= angle <= self.LEFT_ANGLE_END:
+                left.append(d)
+            if self.RIGHT_ANGLE_START <= angle <= self.RIGHT_ANGLE_END:
+                right.append(d)
+        self._min_front = float(np.percentile(front, 10)) if front else float('inf')
+        self._avg_left  = float(np.median(left))          if left  else float('inf')
+        self._avg_right = float(np.median(right))         if right else float('inf')
+        self._scan_received = True
+
+    # ── OPEN CAMERA WITH RETRY ───────────────────────────────────
+    def _open_camera(self):
+        for attempt in range(5):
+            cap = cv2.VideoCapture(self.CAM_INDEX)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.CAM_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAM_HEIGHT)
+                ret, frame = cap.read()
+                print("FRAME READ")
+                if ret and frame is not None:
+                    self.get_logger().info(f'Camera opened on attempt {attempt+1}')
+                    return cap
+            cap.release()
+            self.get_logger().warn(f'Camera open attempt {attempt+1} failed, retrying...')
+            time.sleep(2.0)
+        return None
+
+    # ── CAMERA THREAD — person following only ────────────────────
+    def _camera_loop(self):
+        cap = self._open_camera()
+        if cap is None:
+            self.get_logger().error('Cannot open camera after 5 attempts!')
+            self._cam_running = False
+            return
+
+        frame_cx = self.CAM_WIDTH / 2.0
+        print("CAMERA LOOP STARTED")
+
+        for _ in range(100000):
+            ret, frame = cap.read()
+            if not ret:
+                self.get_logger().warn('Frame failed — reopening camera')
+                cap.release()
+                time.sleep(1.0)
+                cap = self._open_camera()
+                if cap is None:
+                    break
+                continue
+
+            now = time.time()
+            child_angle   = None
+            child_visible = False
+            print("RUNNING YOLO")
+            results = self.yolo(frame, imgsz=224, verbose=False)
+            print("YOLO DONE")
+            print(results[0].boxes)
+            best_area = 0
+            best_angle = None
+            
+            for box in results[0].boxes:
+                conf = float(box.conf[0])
+                cls  = int(box.cls[0])
+                
+                if cls != 0 or conf < 0.3:
+                    continue
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                
+                area = (x2 - x1) * (y2 - y1)
+                
+                if area > best_area:
+                    best_area = area
+                    bbox_cx = (x1 + x2) / 2.0
+                    best_angle = ((bbox_cx - frame_cx) / frame_cx) * (self.HFOV / 2.0)
+            
+            if best_angle is not None:
+                child_angle = best_angle
+                child_visible = True
+                print("PERSON DETECTED:", child_angle)
+            else:
+                child_visible = False
+
+
+            # ── Update shared state ──────────────────────────────
+            with self._child_lock:
+                if child_visible:
+                    self._child_angle      = child_angle
+                    self._child_visible    = True
+                    self._last_known_angle = child_angle
+                    self._last_seen_time   = self.get_clock().now()
+                else:
+                    self._child_visible = False
+                    age = (self.get_clock().now() -
+                           self._last_seen_time).nanoseconds / 1e9
+                    if age < 3.0 and self._last_known_angle is not None:
+                        self._child_angle = self._last_known_angle
+                    else:
+                        self._child_angle = None
+
+        cap.release()
+
+    # ── PID ──────────────────────────────────────────────────────
+    def pid_speed(self, distance):
+        error = distance - self.FOLLOW_DISTANCE
+        self._integral   = np.clip(
+            self._integral + error * self._dt, -1.0, 1.0
+        )
+        derivative        = (error - self._prev_error) / self._dt
+        self._prev_error  = error
+        output = self.Kp * error + self.Ki * self._integral + self.Kd * derivative
+        return float(np.clip(output, 0.0, self.MAX_SPEED))
+
+    def smooth_turn(self, raw):
+        self._turn_history.pop(0)
+        self._turn_history.append(raw)
+        return float(np.mean(self._turn_history))
+
+    def _choose_turn_direction(self):
+        self._turn_direction = 1 if self._avg_left >= self._avg_right else -1
+
+    # ── CONTROL LOOP ─────────────────────────────────────────────
+    def control_loop(self):
+        cmd = Twist()
+
+        if not self._scan_received:
+            self.cmd_pub.publish(cmd)
+            return
+
+        front = self._min_front
+
+        with self._child_lock:
+            child_angle   = self._child_angle
+            child_visible = self._child_visible
+        
+        print("FRONT:", front)
+
+        # ── OBSTACLE AVOIDANCE (LIDAR only) ──────────────────────
+        if self._avoidance_state == 'recovering':
+            self._recovery_cycles += 1
+            if self._recovery_cycles >= self.RECOVERY_DURATION:
+                self._turn_direction   *= -1
+                self._turn_cycle_count  = 0
+                self._recovery_cycles   = 0
+                self._avoidance_state   = 'avoiding'
+            else:
+                cmd.linear.x  = -0.08
+                cmd.angular.z =  0.0
+            self.cmd_pub.publish(cmd)
+            return
+
+        if self._avoidance_state == 'avoiding':
+            if front > self.SAFE_DISTANCE:
+                self._clear_scan_counter += 1
+                if self._clear_scan_counter >= self.CLEAR_SCANS_NEEDED:
+                    self._avoidance_state    = 'forward'
+                    self._turn_cycle_count   = 0
+                    self._clear_scan_counter = 0
+                    self.get_logger().info('Path clear!')
+            else:
+                self._clear_scan_counter  = 0
+                self._turn_cycle_count   += 1
+                if self._turn_cycle_count >= self.MAX_TURN_CYCLES:
+                    self._avoidance_state = 'recovering'
+                    self._recovery_cycles = 0
+                    self.cmd_pub.publish(cmd)
+                    return
+            cmd.linear.x  = 0.05 if front > self.SAFE_DISTANCE * 1.3 else 0.0
+            cmd.angular.z = self._turn_direction * self.TURN_SPEED
+            self.cmd_pub.publish(cmd)
+            return
+
+        if self._avoidance_state == 'slowing':
+            if front <= self.SAFE_DISTANCE:
+                self._avoidance_state    = 'avoiding'
+                self._clear_scan_counter = 0
+                self._turn_cycle_count   = 0
+                self._choose_turn_direction()
+            elif front > self.SLOW_DISTANCE:
+                self._avoidance_state = 'forward'
+            else:
+                ratio = (front - self.SAFE_DISTANCE) / (self.SLOW_DISTANCE - self.SAFE_DISTANCE)
+                cmd.linear.x  = max(0.04, 0.15 * ratio)
+                cmd.angular.z = 0.0
+            self.cmd_pub.publish(cmd)
+            return
+
+        if front <= self.SAFE_DISTANCE:
+            self._avoidance_state    = 'avoiding'
+            self._clear_scan_counter = 0
+            self._turn_cycle_count   = 0
+            self._choose_turn_direction()
+            self.get_logger().warn(f'Obstacle {front:.2f}m!')
+            self.cmd_pub.publish(cmd)
+            return
+        elif front <= self.SLOW_DISTANCE:
+            self._avoidance_state = 'slowing'
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── PERSON FOLLOWING (camera only) ───────────────────────
+        if child_angle is None:
+            age = (
+                self.get_clock().now() -
+                self._last_seen_time
+                ).nanoseconds / 1e9
+                
+                # wait briefly before searching
+            if age < 1.5:
+                cmd.angular.z = 0.0
+                    
+            else:
+                cmd.angular.z = 0.25
+                    
+            self.get_logger().info(
+                'No person — searching',
+                throttle_duration_sec=2.0
+                )
+                    
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Distance from LIDAR front
+        distance = front if 0.3 < front < 3.5 else 2.0
+
+        # Already close enough
+        if distance < 0.5:
+            if abs(child_angle) > self.ANGLE_DEADZONE:
+                cmd.angular.z = self.smooth_turn(float(np.clip(
+                    np.radians(child_angle) * 1.0,
+                    -self.MAX_TURN, self.MAX_TURN
+                )))
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Turn toward person
+        if abs(child_angle) > self.ANGLE_DEADZONE:
+            raw_turn = float(np.clip(
+                np.radians(child_angle) * 1.2,
+                -self.MAX_TURN, self.MAX_TURN
+            ))
+        else:
+            raw_turn = 0.0
+        cmd.angular.z = self.smooth_turn(raw_turn)
+
+        # Move toward person
+        turn_factor  = 1.0 - min(abs(child_angle) / 90.0, 1.0)
+        cmd.linear.x = self.pid_speed(distance) * turn_factor
+
+        state = 'LIVE' if child_visible else 'LAST'
+        self.get_logger().info(
+            f'[{state}] angle:{child_angle:.1f}° '
+            f'dist:{distance:.2f}m '
+            f'spd:{cmd.linear.x:.2f} '
+            f'turn:{cmd.angular.z:.2f} '
+            f'front:{front:.2f}m'
+        )
+        self.cmd_pub.publish(cmd)
+
+    def destroy_node(self):
+        self._cam_running = False
+        self._cam_thread.join(timeout=2.0)
+        try:
+            self.cmd_pub.publish(Twist())
+        except Exception:
+            pass
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PersonFollower()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+EOF
