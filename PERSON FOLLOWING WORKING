@@ -1,0 +1,18 @@
+Terminal 1 — bringup:
+
+bashcd ~/turtlebot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export TURTLEBOT3_MODEL=waffle_pi
+export LDS_MODEL=LDS-01
+ros2 launch turtlebot3_bringup robot.launch.py
+
+Terminal 2 — camera:
+
+bashpython3 ~/camera_node_standalone.py
+
+Terminal 3 — follower:
+
+bashsource /opt/ros/humble/setup.bash
+python3 ~/follower_standalone.py
+
