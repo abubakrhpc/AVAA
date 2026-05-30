@@ -1,0 +1,262 @@
+KEEP IN MIND TO ENTER THE PI'S IP ADRESS WHEN ASKED
+Terminal 1 — Rosbridge WebSocket server:
+
+bashsource ~/.bashrc
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+
+Terminal 2 — Turtlebot3 bringup:
+
+bashsource ~/.bashrc
+ros2 launch turtlebot3_bringup robot.launch.py
+
+Terminal 3 — Web server:
+
+bashcd ~/teleop_web
+python3 -m http.server 8080
+
+HOW TO ACCES CODE: 
+mkdir -p ~/teleop_web
+nano ~/teleop_web/index.html
+
+CODE:
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Turtlebot3 Control</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #111; color: #fff;
+      font-family: sans-serif;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      height: 100vh; gap: 20px;
+      touch-action: none;
+    }
+    h2 { font-size: 1.2rem; letter-spacing: 2px; color: #0ff; }
+    #status {
+      font-size: 0.85rem; color: #aaa;
+      background: #1a1a1a; padding: 6px 14px;
+      border-radius: 20px;
+    }
+    #status.ok { color: #0f0; }
+    #status.err { color: #f44; }
+    #joystick-zone {
+      width: 260px; height: 260px;
+      background: #1e1e1e;
+      border: 2px solid #333;
+      border-radius: 50%;
+      position: relative;
+      touch-action: none;
+    }
+    #stick {
+      width: 80px; height: 80px;
+      background: radial-gradient(circle, #0ff, #007a7a);
+      border-radius: 50%;
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 20px #0ff5;
+      transition: box-shadow 0.1s;
+    }
+    #stick.active { box-shadow: 0 0 35px #0ff; }
+    #velocity-display {
+      font-size: 0.9rem; color: #888;
+      display: flex; gap: 24px;
+    }
+    #velocity-display span { color: #0ff; }
+    #stop-btn {
+      padding: 14px 48px;
+      background: #c0392b; color: white;
+      border: none; border-radius: 12px;
+      font-size: 1.1rem; font-weight: bold;
+      letter-spacing: 1px;
+      cursor: pointer; touch-action: manipulation;
+    }
+    #stop-btn:active { background: #e74c3c; transform: scale(0.97); }
+    #ip-bar {
+      display: flex; gap: 10px; align-items: center;
+    }
+    #ip-input {
+      background: #222; color: #fff;
+      border: 1px solid #444; border-radius: 8px;
+      padding: 8px 12px; font-size: 0.95rem;
+      width: 220px;
+    }
+    #connect-btn {
+      padding: 8px 18px;
+      background: #0077aa; color: white;
+      border: none; border-radius: 8px;
+      font-size: 0.95rem; cursor: pointer;
+    }
+    #connect-btn:active { background: #0099cc; }
+  </style>
+</head>
+<body>
+  <h2>🤖 TURTLEBOT3 CONTROL</h2>
+
+  <div id="ip-bar">
+    <input id="ip-input" type="text" placeholder="192.168.x.x" />
+    <button id="connect-btn" onclick="connectROS()">Connect</button>
+  </div>
+
+  <div id="status">Not connected</div>
+
+  <div id="joystick-zone">
+    <div id="stick"></div>
+  </div>
+
+  <div id="velocity-display">
+    Linear: <span id="lin-val">0.00</span> m/s &nbsp;|&nbsp;
+    Angular: <span id="ang-val">0.00</span> rad/s
+  </div>
+
+  <button id="stop-btn" onclick="emergencyStop()">⛔ STOP</button>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/roslibjs/1.1.0/roslib.min.js"></script>
+  <script>
+    let ros = null, cmdVelTopic = null;
+    let publishing = false;
+    let linear = 0, angular = 0;
+
+    const MAX_LINEAR = 0.22;
+    const MAX_ANGULAR = 2.0;
+
+    const zone = document.getElementById('joystick-zone');
+    const stick = document.getElementById('stick');
+    const statusEl = document.getElementById('status');
+
+    function connectROS() {
+      const ip = document.getElementById('ip-input').value.trim();
+      if (!ip) { alert('Enter your Pi IP address first'); return; }
+
+      if (ros) { ros.close(); }
+
+      statusEl.textContent = 'Connecting...';
+      statusEl.className = '';
+
+      ros = new ROSLIB.Ros({ url: 'ws://' + ip + ':9090' });
+
+      ros.on('connection', () => {
+        statusEl.textContent = '✅ Connected to ' + ip;
+        statusEl.className = 'ok';
+        cmdVelTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: '/cmd_vel',
+          messageType: 'geometry_msgs/Twist'
+        });
+        startPublishing();
+      });
+
+      ros.on('error', () => {
+        statusEl.textContent = '❌ Connection failed — check IP & rosbridge';
+        statusEl.className = 'err';
+      });
+
+      ros.on('close', () => {
+        statusEl.textContent = 'Disconnected';
+        statusEl.className = 'err';
+        stopPublishing();
+      });
+    }
+
+    function publishVelocity() {
+      if (!cmdVelTopic) return;
+      const msg = new ROSLIB.Message({
+        linear: { x: linear, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: angular }
+      });
+      cmdVelTopic.publish(msg);
+    }
+
+    let pubInterval = null;
+    function startPublishing() {
+      if (pubInterval) clearInterval(pubInterval);
+      pubInterval = setInterval(publishVelocity, 100);
+    }
+    function stopPublishing() {
+      if (pubInterval) clearInterval(pubInterval);
+      pubInterval = null;
+    }
+
+    function emergencyStop() {
+      linear = 0; angular = 0;
+      publishVelocity();
+      resetStick();
+    }
+
+    // --- Joystick logic ---
+    let dragging = false;
+    let originX, originY;
+    const RADIUS = 90;
+
+    function getCenter() {
+      const r = zone.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+
+    function updateStick(clientX, clientY) {
+      const c = getCenter();
+      let dx = clientX - c.x;
+      let dy = clientY - c.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > RADIUS) {
+        dx = (dx / dist) * RADIUS;
+        dy = (dy / dist) * RADIUS;
+      }
+      stick.style.left = (50 + (dx / RADIUS) * 38) + '%';
+      stick.style.top  = (50 + (dy / RADIUS) * 38) + '%';
+
+      // dy negative = forward, dx positive = turn right
+      linear  =  (-dy / RADIUS) * MAX_LINEAR;
+      angular = (-dx / RADIUS) * MAX_ANGULAR;
+
+      document.getElementById('lin-val').textContent = linear.toFixed(2);
+      document.getElementById('ang-val').textContent = angular.toFixed(2);
+    }
+
+    function resetStick() {
+      stick.style.left = '50%';
+      stick.style.top  = '50%';
+      linear = 0; angular = 0;
+      document.getElementById('lin-val').textContent = '0.00';
+      document.getElementById('ang-val').textContent = '0.00';
+      stick.classList.remove('active');
+    }
+
+    zone.addEventListener('touchstart', e => {
+      e.preventDefault();
+      dragging = true;
+      stick.classList.add('active');
+      updateStick(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: false });
+
+    zone.addEventListener('touchmove', e => {
+      e.preventDefault();
+      if (dragging) updateStick(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: false });
+
+    zone.addEventListener('touchend', e => {
+      e.preventDefault();
+      dragging = false;
+      resetStick();
+      publishVelocity();
+    }, { passive: false });
+
+    // Mouse support for desktop testing
+    zone.addEventListener('mousedown', e => {
+      dragging = true;
+      stick.classList.add('active');
+      updateStick(e.clientX, e.clientY);
+    });
+    document.addEventListener('mousemove', e => {
+      if (dragging) updateStick(e.clientX, e.clientY);
+    });
+    document.addEventListener('mouseup', () => {
+      if (dragging) { dragging = false; resetStick(); publishVelocity(); }
+    });
+  </script>
+</body>
+</html>
