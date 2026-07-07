@@ -1,0 +1,196 @@
+import cv2
+import requests
+import time
+import threading
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from flask import Flask, jsonify
+from flask_cors import CORS
+
+
+PI_IP       = '192.168.0.135'
+STREAM      = f'http://{PI_IP}:5000/video'
+ANGLE_URL   = f'http://{PI_IP}:5000/set_angle'
+LAPTOP_PORT = 5002
+
+
+# ── shared latest frame ───────────────────────────────────────
+latest_raw   = None
+raw_lock     = threading.Lock()
+stream_alive = True
+
+
+def frame_reader():
+   """Constantly reads stream, always keeps only latest frame."""
+   global latest_raw, stream_alive
+   cap = cv2.VideoCapture(STREAM)
+   cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+   while stream_alive:
+       ret, frame = cap.read()
+       if not ret:
+           print('Stream lost, retrying...')
+           time.sleep(1.0)
+           cap = cv2.VideoCapture(STREAM)
+           cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+           continue
+       with raw_lock:
+           latest_raw = frame  # always overwrite — no queue buildup
+   cap.release()
+
+
+# Start reader thread immediately
+threading.Thread(target=frame_reader, daemon=True).start()
+
+
+# ── Flask for laptop endpoints ────────────────────────────────
+app_laptop = Flask(__name__)
+CORS(app_laptop)
+
+
+target_id   = None
+target_lock = threading.Lock()
+
+
+@app_laptop.route('/reset_target', methods=['POST'])
+def reset_target():
+   global target_id
+   with target_lock:
+       target_id = None
+   print('Target reset!')
+   return jsonify({'status': 'reset'})
+
+
+@app_laptop.route('/health')
+def health():
+   return jsonify({'status': 'online', 'target': target_id})
+
+
+threading.Thread(
+   target=lambda: app_laptop.run(host='0.0.0.0', port=LAPTOP_PORT),
+   daemon=True
+).start()
+
+
+# ── Models ────────────────────────────────────────────────────
+print('Loading YOLO + DeepSORT...')
+model   = YOLO('yolov8n.pt')
+tracker = DeepSort(
+   max_age=60,
+   n_init=1,
+   embedder='mobilenet',
+   embedder_gpu=False
+)
+print('Ready!')
+
+
+HFOV     = 78.0
+frame_cx = 320.0
+MIN_CONF = 0.5
+
+
+# ── Main processing loop ──────────────────────────────────────
+print(f'Processing stream from {STREAM}')
+print('Waiting for first frame...')
+
+
+while True:
+   # Grab latest frame — non-blocking
+   with raw_lock:
+       if latest_raw is None:
+           time.sleep(0.01)
+           continue
+       frame = latest_raw.copy()
+
+
+   start = time.time()
+
+
+   # YOLO
+   results = model(frame, imgsz=160, classes=[0],
+                  conf=MIN_CONF, verbose=False)
+
+
+   detections = []
+   for box in results[0].boxes:
+       x1, y1, x2, y2 = map(float, box.xyxy[0])
+       conf = float(box.conf[0])
+       detections.append(([x1, y1, x2-x1, y2-y1], conf, 0))
+
+
+   # DeepSORT
+   tracks = tracker.update_tracks(detections, frame=frame)
+
+
+   best_angle = None
+   best_area  = 0
+
+
+   with target_lock:
+       current_target = target_id
+
+
+   for track in tracks:
+       if not track.is_confirmed():
+           continue
+       tid  = track.track_id
+       ltrb = track.to_ltrb()
+       x1, y1, x2, y2 = map(int, ltrb)
+       area = (x2-x1) * (y2-y1)
+
+
+       if current_target is None:
+           with target_lock:
+               target_id      = tid
+               current_target = tid
+           print(f'Locked onto ID {target_id}')
+
+
+       if tid == current_target:
+           cx         = (x1+x2) / 2.0
+           best_angle = -1 * ((cx - frame_cx) / frame_cx) * (HFOV / 2.0)
+           best_area  = area
+           cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+           cv2.putText(frame, f'TARGET #{tid}',
+                      (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                      0.6, (0,255,0), 2)
+       else:
+           cv2.rectangle(frame, (x1,y1), (x2,y2), (128,128,128), 1)
+           cv2.putText(frame, f'#{tid}',
+                      (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX,
+                      0.5, (128,128,128), 1)
+
+
+   elapsed = time.time() - start
+
+
+   if best_angle is not None:
+       cv2.putText(frame, f'Angle:{best_angle:.1f}',
+                  (10,30), cv2.FONT_HERSHEY_SIMPLEX,
+                  0.8, (0,255,0), 2)
+
+
+   cv2.putText(frame, f'{1/elapsed:.0f} FPS  {elapsed*1000:.0f}ms',
+              (10,60), cv2.FONT_HERSHEY_SIMPLEX,
+              0.6, (0,200,255), 2)
+
+
+   print(f'{elapsed*1000:.0f}ms | {1/elapsed:.0f}FPS | '
+         f'target:{current_target} | angle:{best_angle}')
+
+
+   # Send angle to Pi
+   try:
+       requests.post(ANGLE_URL,
+                    json={'angle': best_angle},
+                    timeout=0.05)
+   except Exception:
+       pass
+
+
+   cv2.imshow('AVAA — Laptop YOLO', frame)
+   if cv2.waitKey(1) & 0xFF == ord('q'):
+       break
+
+
+stream_alive = False
+cv2.destroyAllWindows()
