@@ -1,0 +1,282 @@
+import threading, time, socket, subprocess
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan, BatteryState
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
+import cv2, numpy as np
+
+app = Flask(__name__)
+CORS(app)
+
+# ── shared state ──────────────────────────────────────────────
+latest_frame      = None
+frame_lock        = threading.Lock()
+person_angle      = None
+angle_lock        = threading.Lock()
+emergency_stopped = False
+cam_running       = False
+follower_running  = False
+battery_level     = 0.0
+
+# ── CAMERA THREAD (no YOLO — laptop handles detection) ────────
+def camera_loop():
+    global latest_frame, cam_running
+
+    subprocess.run(['sudo', 'fuser', '-k', '/dev/video0'],
+                   capture_output=True)
+    time.sleep(1.0)
+
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 10)
+
+    if not cap.isOpened():
+        print('Camera: failed!')
+        cam_running = False
+        return
+
+    print('Camera: open! YOLO running on laptop.')
+
+    while cam_running:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        with frame_lock:
+            latest_frame = frame.copy()
+
+    cap.release()
+    print('Camera: stopped')
+
+# ── FOLLOWER THREAD (exact same as follower_standalone.py) ────
+def follower_loop():
+    global follower_running, emergency_stopped
+
+    rclpy.init()
+
+    class Follower(Node):
+        def __init__(self):
+            super().__init__('follower')
+
+            self.MAX_TURN     = 0.35
+            self.MAX_SPEED    = 0.20
+            self.ANGLE_DEAD   = 12.0
+            self.LOST_TIMEOUT = 2.0
+            self.BACK_SPEED   = 0.08
+            self.FOLLOW_DIST  = 0.7
+            self.TOO_CLOSE    = 0.5
+            self.TOO_FAR      = 0.9
+            self.SEARCH_START = 3.0
+            self.SEARCH_STOP  = 13.0
+
+            self._front_dist = None
+            self._last_seen  = time.time()
+
+            sensor_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10
+            )
+
+            self.scan_sub    = self.create_subscription(
+                LaserScan, '/scan', self.scan_cb, sensor_qos)
+            self.battery_sub = self.create_subscription(
+                BatteryState, '/battery_state', self.battery_cb, 10)
+            self.cmd_pub     = self.create_publisher(Twist, '/cmd_vel', 10)
+            self.timer       = self.create_timer(0.1, self.loop)
+
+            self.get_logger().info('=== Follower Ready ===')
+
+        def scan_cb(self, msg):
+            front = []
+            for i, d in enumerate(msg.ranges):
+                if not np.isfinite(d) or d < 0.1 or d > 10.0:
+                    continue
+                deg = (np.degrees(
+                    msg.angle_min + i * msg.angle_increment
+                )) % 360
+                if deg <= 15 or deg >= 345:
+                    front.append(d)
+            if front:
+                self._front_dist = float(np.percentile(front, 10))
+                self.get_logger().info(
+                    f'LIDAR front: {len(front)} rays, dist:{self._front_dist:.2f}m',
+                    throttle_duration_sec=1.0)
+
+        def battery_cb(self, msg):
+            global battery_level
+            pct = msg.percentage
+            if pct > 1.0:
+                battery_level = round(min(pct, 100.0), 1)
+            else:
+                battery_level = round(pct * 100, 1)
+
+        def loop(self):
+            cmd     = Twist()
+            elapsed = time.time() - self._last_seen
+
+            if emergency_stopped:
+                self.cmd_pub.publish(cmd)
+                return
+
+            with angle_lock:
+                angle = person_angle
+
+            if angle is not None:
+                self._last_seen = time.time()
+                elapsed = 0.0
+
+            if angle is None:
+                if self.SEARCH_START < elapsed < self.SEARCH_STOP:
+                    cmd.angular.z = 0.25
+                    self.get_logger().info(
+                        f'Searching... ({elapsed:.0f}s)',
+                        throttle_duration_sec=2.0)
+                else:
+                    self.get_logger().info(
+                        'Waiting for person...',
+                        throttle_duration_sec=3.0)
+                self.cmd_pub.publish(cmd)
+                return
+
+            age = time.time() - self._last_seen
+
+            if abs(angle) > self.ANGLE_DEAD:
+                cmd.angular.z = float(np.clip(
+                    np.radians(angle) * 0.8,
+                    -self.MAX_TURN, self.MAX_TURN
+                ))
+
+            if age < 1.0:
+                tf = 1.0 - min(abs(angle) / 60.0, 1.0)
+                if self._front_dist is not None and abs(angle) < 20.0:
+                    dist = self._front_dist
+                    if dist < self.TOO_CLOSE:
+                        cmd.linear.x = -self.BACK_SPEED
+                        self.get_logger().info(
+                            f'Too close {dist:.2f}m — reversing',
+                            throttle_duration_sec=1.0)
+                    elif dist > self.TOO_FAR:
+                        cmd.linear.x = self.MAX_SPEED * tf
+                    else:
+                        cmd.linear.x = 0.0
+                else:
+                    cmd.linear.x = self.MAX_SPEED * 0.5 * tf
+            else:
+                cmd.linear.x = 0.0
+
+            self.get_logger().info(
+                f'angle:{angle:.1f} '
+                f'dist:{self._front_dist:.2f}m '
+                f'spd:{cmd.linear.x:.2f} '
+                f'turn:{cmd.angular.z:.2f}'
+                if self._front_dist else
+                f'angle:{angle:.1f} dist:-- '
+                f'spd:{cmd.linear.x:.2f} '
+                f'turn:{cmd.angular.z:.2f}'
+            )
+            self.cmd_pub.publish(cmd)
+
+        def destroy_node(self):
+            try:
+                self.cmd_pub.publish(Twist())
+            except Exception:
+                pass
+            super().destroy_node()
+
+    node = Follower()
+    while follower_running and rclpy.ok():
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_node()
+    rclpy.shutdown()
+
+# ── VIDEO STREAM ──────────────────────────────────────────────
+def generate():
+    while True:
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.05)
+                continue
+            _, jpeg = cv2.imencode('.jpg', latest_frame,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 70])
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+               + jpeg.tobytes() + b'\r\n')
+
+@app.route('/video')
+def video():
+    return Response(generate(),
+        mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ── ENDPOINTS ─────────────────────────────────────────────────
+@app.route('/start_camera', methods=['POST'])
+def start_camera():
+    global cam_running
+    if not cam_running:
+        cam_running = True
+        threading.Thread(target=camera_loop, daemon=True).start()
+    return jsonify({'status': 'camera started'})
+
+@app.route('/stop_camera', methods=['POST'])
+def stop_camera():
+    global cam_running
+    cam_running = False
+    return jsonify({'status': 'camera stopped'})
+
+@app.route('/start_follower', methods=['POST'])
+def start_follower():
+    global follower_running
+    if not follower_running:
+        follower_running = True
+        threading.Thread(target=follower_loop, daemon=True).start()
+    return jsonify({'status': 'follower started'})
+
+@app.route('/stop_follower', methods=['POST'])
+def stop_follower():
+    global follower_running
+    follower_running = False
+    return jsonify({'status': 'follower stopped'})
+
+@app.route('/emergency_stop', methods=['POST'])
+def do_emergency_stop():
+    global emergency_stopped, cam_running, follower_running
+    emergency_stopped = True
+    cam_running       = False
+    follower_running  = False
+    return jsonify({'status': 'emergency stopped'})
+
+@app.route('/resume', methods=['POST'])
+def resume():
+    global emergency_stopped
+    emergency_stopped = False
+    return jsonify({'status': 'resumed'})
+
+@app.route('/set_angle', methods=['POST'])
+def set_angle():
+    global person_angle
+    data = request.get_json()
+    angle = data.get('angle', None)
+    with angle_lock:
+        person_angle = angle
+    return jsonify({'status': 'ok'})
+
+@app.route('/health')
+def health():
+    return jsonify({
+        'status':    'online',
+        'cam':       cam_running,
+        'following': follower_running,
+        'emergency': emergency_stopped,
+        'battery':   battery_level
+    })
+
+# ── MAIN ──────────────────────────────────────────────────────
+if __name__ == '__main__':
+    ip = socket.gethostbyname(socket.gethostname())
+    print(f'\nAVAA Controller → http://{ip}:5000')
+    print('Endpoints: /start_camera /stop_camera /start_follower')
+    print('           /stop_follower /emergency_stop /resume /video /health /set_angle\n')
+    app.run(host='0.0.0.0', port=5000)
